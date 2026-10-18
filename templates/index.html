@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AD Tube | دانلود از یوتیوب</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="card">
+    <div class="brand" dir="ltr">AD<span>Tube</span></div>
+    <h1>دانلود ویدیو از یوتیوب</h1>
+    <p class="subtitle">لینک ویدیو را بچسبانید و محل ذخیره را انتخاب کنید</p>
+
+    <form id="form">
+      <input id="url" type="url" dir="ltr" placeholder="https://www.youtube.com/watch?v=..." required>
+
+      <div class="folder">
+        <input id="folder" type="text" dir="ltr" placeholder="مسیر ذخیره (خالی = پوشه downloads)">
+        <button id="browse" type="button" class="secondary">انتخاب پوشه</button>
+      </div>
+
+      <button id="btn" type="submit" class="primary">دانلود</button>
+
+      <details class="advanced">
+        <summary>تنظیمات پیشرفته</summary>
+        <input id="proxy" type="text" dir="ltr" placeholder="پروکسی (اختیاری)، مثلاً 127.0.0.1:10808">
+        <small>
+          معمولاً لازم نیست و خالی بماند؛ برنامه خودش مسیر VPN شما را پیدا می‌کند.
+          فقط اگر با روشن بودن VPN پیام «اتصال به یوتیوب برقرار نشد» دیدید، آدرس پروکسی
+          برنامه VPN خود را اینجا بنویسید (معمولاً در تنظیمات برنامه VPN، بخش «Proxy» یا «Local port» می‌آید).
+        </small>
+      </details>
+    </form>
+
+    <div id="bar" class="bar" hidden><div id="bar-fill"></div></div>
+    <p id="bar-info" class="bar-info" hidden></p>
+    <p id="status"></p>
+  </main>
+
+  <footer class="credit">ساخته‌شده با ❤ توسط <span dir="ltr">AD</span></footer>
+
+  <script>
+    const form = document.getElementById("form");
+    const btn = document.getElementById("btn");
+    const status = document.getElementById("status");
+    const folder = document.getElementById("folder");
+    const browse = document.getElementById("browse");
+
+    folder.value = localStorage.getItem("folder") || "";
+
+    browse.addEventListener("click", async () => {
+      browse.disabled = true;
+      try {
+        const res = await fetch("/choose-folder");
+        const data = await res.json();
+        if (data.folder) {
+          folder.value = data.folder;
+          localStorage.setItem("folder", data.folder);
+        }
+      } finally {
+        browse.disabled = false;
+      }
+    });
+
+    folder.addEventListener("change", () => localStorage.setItem("folder", folder.value));
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      btn.disabled = true;
+      status.className = "";
+      status.textContent = "در حال اتصال به یوتیوب...";
+      setBar(0, true);
+      try {
+        const res = await fetch("/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: document.getElementById("url").value, folder: folder.value, proxy: document.getElementById("proxy").value }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        await poll(data.job);
+      } catch (err) {
+        status.className = "error";
+        status.textContent = err.message;
+        setBar(0, false);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    const bar = document.getElementById("bar");
+    const barFill = document.getElementById("bar-fill");
+    const barInfo = document.getElementById("bar-info");
+
+    function setBar(percent, visible) {
+      bar.hidden = barInfo.hidden = !visible;
+      barFill.style.width = percent + "%";
+    }
+
+    const fa = (n) => Number(n).toLocaleString("fa-IR");
+    const mb = (b) => fa((b / 1048576).toFixed(1));
+    function fmtEta(s) {
+      if (s == null) return "—";
+      const m = Math.floor(s / 60), sec = s % 60;
+      return fa(m) + ":" + fa(String(sec).padStart(2, "0"));
+    }
+
+    async function poll(job) {
+      while (true) {
+        const res = await fetch("/progress/" + job);
+        const j = await res.json();
+        if (j.phase === "error") throw new Error(j.error);
+        setBar(j.percent || 0, true);
+        if (j.phase === "done") {
+          barInfo.textContent = "۱۰۰٪";
+          status.className = "success";
+          status.textContent = "دانلود شد: " + j.title + " ← " + j.path;
+          return;
+        }
+        if (j.phase === "merging") {
+          status.textContent = "در حال ترکیب ویدیو و صدا...";
+          barInfo.textContent = "۹۹٪";
+        } else if (j.phase === "downloading") {
+          status.textContent = "در حال دانلود: " + (j.title || "");
+          barInfo.textContent =
+            fa(Math.floor(j.percent)) + "٪ — " + mb(j.downloaded || 0) + " از " + mb(j.total || 0) +
+            " مگابایت — " + mb(j.speed || 0) + " مگابایت بر ثانیه — زمان باقی‌مانده " + fmtEta(j.eta);
+        }
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    }
+  </script>
+</body>
+</html>
