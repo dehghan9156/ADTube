@@ -6,8 +6,7 @@
 Run `pip install -r requirements.txt` then `python main.py` and open http://127.0.0.1:5000.
 For personal use only; you are responsible for complying with YouTube's Terms of Service and copyright law.
 
-<!-- بعد از گرفتن اسکرین‌شات، این خط را فعال کنید: -->
-<!-- ![screenshot](docs/screenshot.png) -->
+![screenshot](docs/screenshot.png)
 
 ## ویژگی‌ها
 
