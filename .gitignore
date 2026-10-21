@@ -4,3 +4,6 @@ downloads/*
 !downloads/.gitkeep
 .venv/
 .vscode/
+
+# internal technical notes (private)
+docs/TECHNICAL.md

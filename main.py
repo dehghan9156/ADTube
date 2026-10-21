@@ -1,4 +1,5 @@
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from urllib.request import getproxies
 import imageio_ffmpeg
 from flask import Flask, jsonify, render_template, request
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, sanitize_filename
 
 app = Flask(__name__)
 
@@ -35,7 +36,11 @@ FORMAT_OPTS = {
     "merge_output_format": "mp4",
     "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
 }
+# یوتیوب برای باز کردن لینک‌های کامل به یک runtime جاوااسکریپت نیاز دارد؛ اگر Node نصب باشد استفاده می‌شود
+if shutil.which("node"):
+    FORMAT_OPTS["js_runtimes"] = {"node": {}}
 
+_browser = ""  # مرورگری که کوکی‌های یوتیوب از آن خوانده می‌شود (برای عبور از «ربات نیستم»)
 _last_working = None  # آخرین مسیر اتصالی که جواب داده، دفعه بعد اول امتحان می‌شود
 
 
@@ -78,6 +83,25 @@ def candidate_proxies(manual):
     return out
 
 
+class Cancelled(Exception):
+    """کاربر دکمه توقف را زده است."""
+
+
+class JobLogger:
+    """هشدار و خطای yt-dlp را در وضعیت کار می‌گذارد تا وقتی دانلود گیر می‌کند علتش دیده شود."""
+
+    def __init__(self, job):
+        self.job = job
+
+    def debug(self, msg):
+        if msg.startswith("[download] Got error"):
+            self.job["note"] = clean(msg)[:300]
+
+    def info(self, msg): pass
+    def warning(self, msg): self.job["note"] = clean(msg)[:300]
+    def error(self, msg): self.job["note"] = clean(msg)[:300]
+
+
 class SilentLogger:
     """خطاهای مسیرهای ناموفق را در کنسول چاپ نمی‌کند؛ مسیر بعدی امتحان می‌شود."""
 
@@ -88,7 +112,7 @@ class SilentLogger:
 
 
 def base_opts(proxy):
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -99,6 +123,9 @@ def base_opts(proxy):
         # رشته خالی یعنی اتصال مستقیم و نادیده گرفتن پروکسی سیستم
         "proxy": proxy if proxy else "",
     }
+    if _browser:
+        opts["cookiesfrombrowser"] = (_browser,)
+    return opts
 
 
 def clean(msg):
@@ -141,10 +168,14 @@ def download():
     except OSError as e:
         return jsonify(error=f"مسیر ذخیره نامعتبر است: {e}"), 400
 
+    global _browser
+    _browser = body.get("browser", "").strip()
+
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"phase": "connecting", "percent": 0}
     threading.Thread(
-        target=run_job, args=(job_id, url, folder, body.get("proxy", "").strip()), daemon=True
+        target=run_job, args=(job_id, url, folder, body.get("proxy", "").strip(), bool(body.get("playlist"))),
+        daemon=True
     ).start()
     return jsonify(job=job_id)
 
@@ -157,47 +188,121 @@ def progress(job_id):
     return jsonify(job)
 
 
-def run_job(job_id, url, folder, manual_proxy):
+def download_once(job, url, folder, proxy, base=0.0, span=100.0):
+    """یک ویدیو را دانلود می‌کند و درصد پیشرفت را در بازه [base, base+span] کل کار می‌نویسد."""
+    opts = base_opts(proxy) | FORMAT_OPTS | {
+        "outtmpl": str(folder / "%(title)s [%(id)s].%(ext)s"),
+        "socket_timeout": 15,
+        "retries": 2,
+        "logger": JobLogger(job),
+    }
+    ydl = YoutubeDL(opts)
+    info = ydl.extract_info(url, download=False)
+    streams = info.get("requested_formats") or [info]
+    expected = sum(s.get("filesize") or s.get("filesize_approx") or 0 for s in streams)
+    job.update(phase="downloading", title=info.get("title", ""), note="")
+
+    per_file = {}  # نام فایل -> بایت دانلودشده
+
+    def on_progress(d):
+        if job.get("cancel"):
+            raise Cancelled()
+        if d["status"] not in ("downloading", "finished"):
+            return
+        done = d.get("downloaded_bytes") or 0
+        per_file[d["filename"]] = done
+        downloaded = sum(per_file.values())
+        total = max(expected, downloaded)
+        speed = d.get("speed") or 0
+        pct = min(99.0, downloaded * 100 / total) if total else 0
+        job.update(
+            downloaded=downloaded,
+            total=total,
+            speed=speed,
+            eta=int((total - downloaded) / speed) if speed else None,
+            percent=base + pct * span / 100,
+        )
+
+    def on_postprocess(d):
+        if d["status"] == "started":
+            job.update(phase="merging", percent=base + 0.99 * span, speed=0, eta=None)
+
+    ydl.add_progress_hook(on_progress)
+    ydl.add_postprocessor_hook(on_postprocess)
+    with ydl:
+        info = ydl.process_ie_result(info, download=True)
+        return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+
+
+def download_video(job, url, folder, proxy, base=0.0, span=100.0):
+    """گاهی سرور ویدیوی اختصاص‌داده‌شده از مسیر VPN در دسترس نیست؛ با استخراج دوباره، سرور دیگری گرفته می‌شود."""
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            return download_once(job, url, folder, proxy, base, span)
+        except DownloadError as e:
+            if not NETWORK_ERROR.search(clean(e)):
+                raise
+            if attempt == attempts:
+                raise DownloadError(
+                    "سرور ویدیوی یوتیوب از مسیر VPN شما در دسترس نیست (صفحه یوتیوب باز می‌شود ولی خود ویدیو نه). "
+                    "سرور/لوکیشن VPN را عوض کنید یا VPN دیگری امتحان کنید."
+                ) from e
+            job.update(note=f"اتصال به سرور ویدیو کند است، تلاش مجدد ({attempt}/{attempts - 1})...", downloaded=0)
+
+
+@app.post("/cancel/<job_id>")
+def cancel(job_id):
+    job = jobs.get(job_id)
+    if job is None:
+        return jsonify(error="کار پیدا نشد"), 404
+    job["cancel"] = True
+    return jsonify(ok=True)
+
+
+def run_playlist(job, url, folder, manual_proxy):
+    # فهرست ویدیوها بدون دانلود (flat) گرفته می‌شود، سپس هر کدام جداگانه دانلود می‌شود
+    proxy, info = find_working_route(url, manual_proxy, {"noplaylist": False, "extract_flat": "in_playlist"})
+    entries = [e for e in info.get("entries") or [] if e and e.get("id")]
+    if not entries:
+        raise DownloadError("ویدیویی در این پلی‌لیست پیدا نشد")
+    folder = folder / sanitize_filename(info.get("title") or "playlist")
+    folder.mkdir(parents=True, exist_ok=True)
+
+    count = len(entries)
+    failed = 0
+    last_err = ""
+    job.update(count=count, playlist=info.get("title", ""))
+    for i, entry in enumerate(entries):
+        if job.get("cancel"):
+            raise Cancelled()
+        job.update(index=i + 1)
+        try:
+            download_video(
+                job, f"https://www.youtube.com/watch?v={entry['id']}", folder, proxy,
+                base=i * 100 / count, span=100 / count,
+            )
+        except DownloadError as e:
+            failed += 1  # ویدیوی خصوصی/حذف‌شده؛ بقیه ادامه پیدا می‌کنند
+            last_err = clean(e)
+    if failed == count:
+        raise DownloadError(last_err)
+    job.update(phase="done", percent=100, path=str(folder), failed=failed, last_error=last_err, eta=0, speed=0)
+
+
+def run_job(job_id, url, folder, manual_proxy, playlist=False):
     job = jobs[job_id]
     try:
-        proxy, info = find_working_route(url, manual_proxy, FORMAT_OPTS)
-        streams = info.get("requested_formats") or [info]
-        expected = sum(s.get("filesize") or s.get("filesize_approx") or 0 for s in streams)
-        job.update(phase="downloading", title=info.get("title", ""))
-
-        per_file = {}  # نام فایل -> بایت دانلودشده
-
-        def on_progress(d):
-            if d["status"] not in ("downloading", "finished"):
-                return
-            done = d.get("downloaded_bytes") or 0
-            per_file[d["filename"]] = done
-            downloaded = sum(per_file.values())
-            total = max(expected, downloaded)
-            speed = d.get("speed") or 0
-            job.update(
-                downloaded=downloaded,
-                total=total,
-                speed=speed,
-                eta=int((total - downloaded) / speed) if speed else None,
-                percent=min(99.0, downloaded * 100 / total) if total else 0,
-            )
-
-        def on_postprocess(d):
-            if d["status"] == "started":
-                job.update(phase="merging", percent=99.0, speed=0, eta=None)
-
-        opts = base_opts(proxy) | FORMAT_OPTS | {
-            "outtmpl": str(folder / "%(title)s [%(id)s].%(ext)s"),
-            "socket_timeout": 30,
-            "retries": 10,
-            "progress_hooks": [on_progress],
-            "postprocessor_hooks": [on_postprocess],
-        }
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+        if playlist:
+            run_playlist(job, url, folder, manual_proxy)
+            return
+        proxy, _ = find_working_route(url, manual_proxy)
+        if job.get("cancel"):
+            raise Cancelled()
+        path = download_video(job, url, folder, proxy)
         job.update(phase="done", percent=100, path=str(path), eta=0, speed=0)
+    except Cancelled:
+        job.update(phase="cancelled", speed=0, eta=None)
     except ConnectionError:
         job.update(
             phase="error",

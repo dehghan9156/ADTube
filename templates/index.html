@@ -14,7 +14,9 @@
     <p class="subtitle">لینک ویدیو را بچسبانید و محل ذخیره را انتخاب کنید</p>
 
     <form id="form">
-      <input id="url" type="url" dir="ltr" placeholder="https://www.youtube.com/watch?v=..." required>
+      <input id="url" type="url" dir="ltr" placeholder="https://www.youtube.com/watch?v=... یا https://www.youtube.com/playlist?list=..." required>
+
+      <label class="check"><input id="playlist" type="checkbox"> دانلود کل پلی‌لیست (لینک پلی‌لیست را بچسبانید)</label>
 
       <div class="folder">
         <input id="folder" type="text" dir="ltr" placeholder="مسیر ذخیره (خالی = پوشه downloads)">
@@ -22,9 +24,35 @@
       </div>
 
       <button id="btn" type="submit" class="primary">دانلود</button>
+      <button id="stop" type="button" class="secondary stop" hidden>توقف دانلود</button>
+
+      <details class="advanced">
+        <summary>راهنما</summary>
+        <small>
+          ۱. لینک ویدیو را از نوار آدرس یوتیوب (یا دکمه Share ← Copy) کپی کنید و در کادر بالا بچسبانید.<br>
+          ۲. برای دانلود پلی‌لیست، لینک صفحه پلی‌لیست را بچسبانید
+          (به شکل <span dir="ltr">youtube.com/playlist?list=...</span>)؛ تیک «دانلود کل پلی‌لیست» خودکار زده می‌شود.
+          پلی‌لیست باید Public یا Unlisted باشد.<br>
+          ۳. اگر لینک یک ویدیوی داخل پلی‌لیست است و فقط همان ویدیو را می‌خواهید، تیک پلی‌لیست را بردارید.<br>
+          ۴. «انتخاب پوشه» محل ذخیره را مشخص می‌کند؛ خالی بماند در پوشه downloads ذخیره می‌شود.<br>
+          ۵. با «توقف دانلود» کار متوقف می‌شود. در پلی‌لیست، ویدیوهای کامل‌شده می‌مانند.<br>
+          ۶. VPN باید روشن باشد؛ اگر وصل نشد، پروکسی را در «تنظیمات پیشرفته» وارد کنید.
+        </small>
+      </details>
 
       <details class="advanced">
         <summary>تنظیمات پیشرفته</summary>
+        <select id="browser">
+          <option value="">کوکی مرورگر: استفاده نشود</option>
+          <option value="firefox">Firefox</option>
+          <option value="edge">Edge</option>
+          <option value="chrome">Chrome</option>
+          <option value="brave">Brave</option>
+        </select>
+        <small>
+          اگر خطای «Sign in to confirm you're not a bot» دیدید، مرورگری را که در آن وارد یوتیوب شده‌اید
+          انتخاب کنید (بهتر است آن مرورگر بسته باشد؛ Firefox معمولاً بدون مشکل کار می‌کند).
+        </small>
         <input id="proxy" type="text" dir="ltr" placeholder="پروکسی (اختیاری)، مثلاً 127.0.0.1:10808">
         <small>
           معمولاً لازم نیست و خالی بماند؛ برنامه خودش مسیر VPN شما را پیدا می‌کند.
@@ -47,6 +75,24 @@
     const status = document.getElementById("status");
     const folder = document.getElementById("folder");
     const browse = document.getElementById("browse");
+    const playlist = document.getElementById("playlist");
+    const stop = document.getElementById("stop");
+    const browser = document.getElementById("browser");
+    browser.value = localStorage.getItem("browser") || "";
+    browser.addEventListener("change", () => localStorage.setItem("browser", browser.value));
+    let currentJob = null;
+
+    stop.addEventListener("click", async () => {
+      if (!currentJob) return;
+      stop.disabled = true;
+      status.textContent = "در حال توقف...";
+      await fetch("/cancel/" + currentJob, { method: "POST" });
+    });
+
+    // لینک پلی‌لیست را خودکار تشخیص می‌دهیم
+    document.getElementById("url").addEventListener("input", (e) => {
+      if (/[?&]list=|\/playlist/.test(e.target.value)) playlist.checked = true;
+    });
 
     folder.value = localStorage.getItem("folder") || "";
 
@@ -76,10 +122,13 @@
         const res = await fetch("/download", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: document.getElementById("url").value, folder: folder.value, proxy: document.getElementById("proxy").value }),
+          body: JSON.stringify({ url: document.getElementById("url").value, folder: folder.value, proxy: document.getElementById("proxy").value, playlist: playlist.checked, browser: browser.value }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
+        currentJob = data.job;
+        stop.hidden = false;
+        stop.disabled = false;
         await poll(data.job);
       } catch (err) {
         status.className = "error";
@@ -87,6 +136,8 @@
         setBar(0, false);
       } finally {
         btn.disabled = false;
+        stop.hidden = true;
+        currentJob = null;
       }
     });
 
@@ -112,18 +163,26 @@
         const res = await fetch("/progress/" + job);
         const j = await res.json();
         if (j.phase === "error") throw new Error(j.error);
+        if (j.phase === "cancelled") {
+          status.className = "";
+          status.textContent = "دانلود متوقف شد.";
+          setBar(0, false);
+          return;
+        }
         setBar(j.percent || 0, true);
         if (j.phase === "done") {
           barInfo.textContent = "۱۰۰٪";
           status.className = "success";
-          status.textContent = "دانلود شد: " + j.title + " ← " + j.path;
+          status.textContent = j.count
+            ? "پلی‌لیست دانلود شد (" + fa(j.count - (j.failed || 0)) + " از " + fa(j.count) + " ویدیو) ← " + j.path + (j.failed ? " — خطا: " + j.last_error : "")
+            : "دانلود شد: " + j.title + " ← " + j.path;
           return;
         }
         if (j.phase === "merging") {
           status.textContent = "در حال ترکیب ویدیو و صدا...";
           barInfo.textContent = "۹۹٪";
         } else if (j.phase === "downloading") {
-          status.textContent = "در حال دانلود: " + (j.title || "");
+          status.textContent = (j.note && !j.downloaded ? j.note + "\n" : "") + (j.count ? "[" + fa(j.index) + "/" + fa(j.count) + "] " : "") + "در حال دانلود: " + (j.title || "");
           barInfo.textContent =
             fa(Math.floor(j.percent)) + "٪ — " + mb(j.downloaded || 0) + " از " + mb(j.total || 0) +
             " مگابایت — " + mb(j.speed || 0) + " مگابایت بر ثانیه — زمان باقی‌مانده " + fmtEta(j.eta);

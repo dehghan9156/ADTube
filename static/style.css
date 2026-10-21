@@ -180,6 +180,7 @@ button.secondary:hover:not(:disabled) { background: rgba(255, 255, 255, .14); }
 
 #status {
   min-height: 1.5rem;
+  white-space: pre-line;
   margin: .8rem 0 0;
   line-height: 1.8;
   word-break: break-word;
@@ -203,3 +204,10 @@ button.secondary:hover:not(:disabled) { background: rgba(255, 255, 255, .14); }
   .folder { flex-direction: column; }
   .folder button { padding: .8rem; }
 }
+
+.check { display: flex; align-items: center; gap: .5rem; font-size: .9rem; color: var(--muted); cursor: pointer; }
+.check input { width: auto; flex: none; accent-color: var(--accent); }
+button.stop { width: 100%; padding: .85rem; font-weight: 700; color: var(--accent); background: rgba(255, 61, 74, .1); border: 1px solid var(--accent); }
+button.stop:hover:not(:disabled) { background: rgba(255, 61, 74, .2); }
+.advanced select { width: 100%; margin-top: .6rem; padding: .7rem 1rem; font: inherit; color: var(--text); background: rgba(255, 255, 255, .05); border: 1px solid var(--border); border-radius: 12px; }
+.advanced select option { background: #151922; }
